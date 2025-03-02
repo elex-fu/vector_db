@@ -28,7 +28,7 @@ public class TextSearchExample {
     private static final int VECTOR_DIMENSION = 1536;
     
     // 测试数据集大小 - 增加到10,000个
-    private static final int DATASET_SIZE = 2001;
+    private static final int DATASET_SIZE = 1000;
     
     // 最大显示数量
     private static final int MAX_DISPLAY_COUNT = 10;
@@ -75,6 +75,7 @@ public class TextSearchExample {
         // 生成测试查询
         List<TestQuery> testQueries = new ArrayList<>();
         for (int i = 0; i < NUM_QUERIES; i++) {  // 使用NUM_QUERIES常量
+
             int targetIndex = i % chineseWords.size();
             String targetWord = chineseWords.get(targetIndex);
             String similarWord = generateSimilarWord(targetWord);
