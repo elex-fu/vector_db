@@ -1,7 +1,5 @@
 package com.vectordb.jni;
 
-import lombok.extern.slf4j.Slf4j;
-
 import java.io.*;
 import java.nio.file.*;
 
@@ -9,7 +7,6 @@ import java.nio.file.*;
  * Native库加载器
  * 负责从JAR包或文件系统加载本地库
  */
-@Slf4j
 public class NativeLoader {
 
     private static final String LIBRARY_NAME = "vectordb";
@@ -30,7 +27,7 @@ public class NativeLoader {
             if (libPath != null) {
                 System.load(libPath);
                 loaded = true;
-                log.info("Loaded native library from: {}", libPath);
+                System.out.println("Loaded native library from: " + libPath);
                 return true;
             }
 
@@ -38,10 +35,10 @@ public class NativeLoader {
             try {
                 System.loadLibrary(LIBRARY_NAME);
                 loaded = true;
-                log.info("Loaded native library from java.library.path");
+                System.out.println("Loaded native library from java.library.path");
                 return true;
             } catch (UnsatisfiedLinkError e) {
-                log.debug("Could not load from java.library.path, trying embedded library");
+                System.out.println("Could not load from java.library.path, trying embedded library");
             }
 
             // 从JAR包中解压并加载
@@ -50,7 +47,8 @@ public class NativeLoader {
             return true;
 
         } catch (Exception e) {
-            log.error("Failed to load native library", e);
+            System.err.println("Failed to load native library: " + e.getMessage());
+            e.printStackTrace();
             return false;
         }
     }
@@ -82,7 +80,7 @@ public class NativeLoader {
 
         // 加载库
         System.load(libFile.toAbsolutePath().toString());
-        log.info("Loaded native library from JAR: {}", libFile);
+        System.out.println("Loaded native library from JAR: " + libFile);
     }
 
     /**

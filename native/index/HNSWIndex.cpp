@@ -49,14 +49,18 @@ void HNSWIndex::add(int id, const float* vector) {
     int currObj = entryPoint_.load(std::memory_order_acquire);
     float currDist = computeDistance(vector, currObj);
 
-    for (int level = nodes_[currObj].level; level > newNode.level; level--) {
+    // Search for the nearest entry point from top level down to newNode.level + 1
+    int currLevel = nodes_[currObj].level;
+    while (currLevel > newNode.level) {
         bool changed = true;
         while (changed) {
             changed = false;
-            std::shared_lock<std::shared_mutex> readLock(mutex_);
-            const auto& neighbors = nodes_[currObj].neighbors[level];
-            readLock.unlock();
 
+            // Check bounds before accessing neighbors - removed nested lock since we already hold unique_lock
+            if (currObj < 0 || currObj >= static_cast<int>(nodes_.size())) break;
+            if (currLevel > nodes_[currObj].level) break;
+
+            const auto& neighbors = nodes_[currObj].neighbors[currLevel];
             for (int neighbor : neighbors) {
                 float d = computeDistance(vector, neighbor);
                 if (d < currDist) {
@@ -65,6 +69,12 @@ void HNSWIndex::add(int id, const float* vector) {
                     changed = true;
                 }
             }
+        }
+        // Move down to the next level
+        currLevel--;
+        // Update currLevel if the current node has a lower level
+        if (currObj >= 0 && currObj < static_cast<int>(nodes_.size())) {
+            currLevel = std::min(currLevel, nodes_[currObj].level);
         }
     }
 
@@ -113,13 +123,17 @@ void HNSWIndex::search(const float* query, int k,
     int currObj = entryPoint_.load(std::memory_order_acquire);
     float currDist = computeDistance(query, currObj);
 
-    int maxLevel = nodes_[currObj].level;
+    int currLevel = nodes_[currObj].level;
 
-    for (int level = maxLevel; level > 0; level--) {
+    while (currLevel > 0) {
         bool changed = true;
         while (changed) {
             changed = false;
-            const auto& neighbors = nodes_[currObj].neighbors[level];
+            // Check bounds before accessing neighbors
+            if (currObj < 0 || currObj >= static_cast<int>(nodes_.size())) break;
+            if (currLevel > nodes_[currObj].level) break;
+
+            const auto& neighbors = nodes_[currObj].neighbors[currLevel];
             for (int neighbor : neighbors) {
                 float d = computeDistance(query, neighbor);
                 if (d < currDist) {
@@ -128,6 +142,11 @@ void HNSWIndex::search(const float* query, int k,
                     changed = true;
                 }
             }
+        }
+        currLevel--;
+        // Update currLevel to match current node's level
+        if (currObj >= 0 && currObj < static_cast<int>(nodes_.size())) {
+            currLevel = std::min(currLevel, nodes_[currObj].level);
         }
     }
 
@@ -148,9 +167,16 @@ void HNSWIndex::searchLevel(const float* query, int entryPoint, int ef, int leve
                             std::vector<DistIdPair>& results) {
     std::priority_queue<DistIdPair, std::vector<DistIdPair>, CompareByFirst> candidates;
     std::priority_queue<DistIdPair> bestResults;
-    std::vector<bool> visited(size_, false);
+    // Use capacity instead of size_ to avoid out-of-bounds during construction
+    std::vector<bool> visited(vectorStore_.capacity(), false);
 
     float dist = computeDistance(query, entryPoint);
+
+    if (dist == std::numeric_limits<float>::max()) {
+        results.clear();
+        return;
+    }
+
     candidates.emplace(dist, entryPoint);
     bestResults.emplace(dist, entryPoint);
     visited[entryPoint] = true;
@@ -164,6 +190,11 @@ void HNSWIndex::searchLevel(const float* query, int entryPoint, int ef, int leve
         candidates.pop();
         expansionCount++;
 
+        // Check bounds for curr.second
+        if (curr.second < 0 || curr.second >= vectorStore_.size()) {
+            continue;
+        }
+
         if (curr.first > lowerBound && bestResults.size() >= static_cast<size_t>(ef)) {
             break;
         }
@@ -174,6 +205,11 @@ void HNSWIndex::searchLevel(const float* query, int entryPoint, int ef, int leve
 
         if (config_.distanceThreshold > 0 && curr.first > config_.distanceThreshold) {
             break;
+        }
+
+        // Check if level is valid for this node
+        if (level >= static_cast<int>(nodes_[curr.second].neighbors.size())) {
+            continue;
         }
 
         const auto& neighbors = nodes_[curr.second].neighbors[level];
@@ -338,7 +374,13 @@ int HNSWIndex::getRandomLevel() {
 }
 
 float HNSWIndex::computeDistance(const float* a, int bIndex) {
+    if (bIndex < 0 || bIndex >= vectorStore_.size()) {
+        return std::numeric_limits<float>::max();
+    }
     const float* b = vectorStore_.getVector(bIndex);
+    if (b == nullptr) {
+        return std::numeric_limits<float>::max();
+    }
     return distanceFunc_(a, b, vectorStore_.dimension());
 }
 
