@@ -1,0 +1,120 @@
+name: Native Build
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'native/**'
+      - '.github/workflows/native-build.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'native/**'
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64]
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake g++ googletest
+
+    - name: Configure CMake
+      run: |
+        cd native
+        mkdir build && cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: |
+        cd native/build
+        make -j$(nproc)
+
+    - name: Test
+      run: |
+        cd native/build
+        ctest --output-on-failure
+
+    - name: Upload library
+      uses: actions/upload-artifact@v3
+      with:
+        name: libvectordb-linux-x86_64
+        path: native/build/libvectordb.so
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        brew install cmake googletest
+
+    - name: Configure CMake
+      run: |
+        cd native
+        mkdir build && cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: |
+        cd native/build
+        make -j$(sysctl -n hw.ncpu)
+
+    - name: Test
+      run: |
+        cd native/build
+        ctest --output-on-failure
+
+    - name: Upload library
+      uses: actions/upload-artifact@v3
+      with:
+        name: libvectordb-macos-x86_64
+        path: native/build/libvectordb.dylib
+
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: build-linux
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Download library
+      uses: actions/download-artifact@v3
+      with:
+        name: libvectordb-linux-x86_64
+        path: native/build/
+
+    - name: Install Java
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+
+    - name: Run performance tests
+      run: |
+        cd native/build
+        chmod +x libvectordb.so
+        # Copy to resources
+        mkdir -p ../../src/main/resources/lib/native/linux-x86_64
+        cp libvectordb.so ../../src/main/resources/lib/native/linux-x86_64/
+        # Run tests
+        cd ../..
+        mvn test -Dtest=NativeDistanceBenchmark -DfailIfNoTests=false
+
+  benchmark-report:
+    runs-on: ubuntu-latest
+    needs: performance-test
+    steps:
+    - name: Generate benchmark report
+      run: |
+        echo "## Performance Benchmark Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Distance Calculation Speedup" >> $GITHUB_STEP_SUMMARY
+        echo "- Target: 5x+ vs Java implementation" >> $GITHUB_STEP_SUMMARY
+        echo "- Status: See test output above" >> $GITHUB_STEP_SUMMARY

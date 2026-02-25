@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            lib_name: libvectordb.so
+            platform: linux-x86_64
+          - os: macos-latest
+            lib_name: libvectordb.dylib
+            platform: macos-x86_64
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake g++ googletest
+
+    - name: Install dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install cmake googletest
+
+    - name: Setup Java
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+
+    - name: Build Native Library
+      run: |
+        cd native
+        mkdir -p build && cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release
+        make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+    - name: Build Maven Package
+      run: |
+        # Copy native library to resources
+        mkdir -p src/main/resources/native/${{ matrix.platform }}
+        cp native/build/${{ matrix.lib_name }} src/main/resources/native/${{ matrix.platform }}/
+        # Build with Maven
+        mvn clean package -DskipTests
+
+    - name: Upload Release Asset
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          target/*.jar
+          native/build/${{ matrix.lib_name }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  maven-central:
+    runs-on: ubuntu-latest
+    needs: build-and-release
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup Java
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+        server-id: ossrh
+        server-username: MAVEN_USERNAME
+        server-password: MAVEN_PASSWORD
+
+    - name: Build and Deploy to Maven Central
+      run: |
+        mvn clean deploy -P release -DskipTests
+      env:
+        MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.OSSRH_PASSWORD }}
