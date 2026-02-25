@@ -42,6 +42,7 @@ set(COMPUTE_SOURCES
     compute/DistanceScalar.cpp
     compute/DistanceAVX2.cpp
     compute/SIMDDispatcher.cpp
+    compute/BatchDistance.cpp
 )
 
 set(INDEX_SOURCES
@@ -94,6 +95,42 @@ endif()
 # 链接线程库
 find_package(Threads REQUIRED)
 target_link_libraries(vectordb Threads::Threads)
+
+# BLAS/Accelerate 框架支持
+if(APPLE)
+    # macOS: 使用 Accelerate 框架
+    find_library(ACCELERATE_LIBRARY Accelerate)
+    if(ACCELERATE_LIBRARY)
+        message(STATUS "Accelerate framework found: ${ACCELERATE_LIBRARY}")
+        target_link_libraries(vectordb ${ACCELERATE_LIBRARY})
+        target_compile_definitions(vectordb PRIVATE USE_ACCELERATE=1)
+    else()
+        message(WARNING "Accelerate framework not found, using fallback")
+    endif()
+elseif(UNIX)
+    # Linux: 尝试查找 OpenBLAS
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(OpenBLAS openblas)
+    endif()
+
+    if(OpenBLAS_FOUND)
+        message(STATUS "OpenBLAS found")
+        target_include_directories(vectordb PRIVATE ${OpenBLAS_INCLUDE_DIRS})
+        target_link_libraries(vectordb ${OpenBLAS_LIBRARIES})
+        target_compile_definitions(vectordb PRIVATE USE_OPENBLAS=1)
+    else()
+        # 尝试标准 BLAS
+        find_package(BLAS QUIET)
+        if(BLAS_FOUND)
+            message(STATUS "BLAS found")
+            target_link_libraries(vectordb ${BLAS_LIBRARIES})
+            target_compile_definitions(vectordb PRIVATE USE_BLAS=1)
+        else()
+            message(WARNING "No BLAS library found, using fallback implementation")
+        endif()
+    endif()
+endif()
 
 # 设置库属性
 set_target_properties(vectordb PROPERTIES

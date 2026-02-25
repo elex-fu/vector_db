@@ -294,16 +294,106 @@ std::vector<int> HNSWIndex::selectNeighborsHeuristic(const float* query,
         return result;
     }
 
-    std::vector<int> result;
-    result.reserve(M);
+    // Optimized heuristic selection using precomputed distances and early termination
+    const size_t maxCandidates = std::min(static_cast<size_t>(M * 6), candidates.size());
 
-    const size_t maxCandidates = std::min(static_cast<size_t>(M * 8), candidates.size());
-    std::vector<bool> selected(maxCandidates, false);
-
-    // Pre-fetch all candidate vectors for cache efficiency
+    // Pre-fetch candidate vectors
     for (size_t j = 0; j < maxCandidates; ++j) {
         vectorStore_.prefetchVector(candidates[j].second);
     }
+
+    // Fast path: if dimension is small, use simpler heuristic
+    const int dim = vectorStore_.dimension();
+    const bool useSimpleHeuristic = (dim <= 128) || (M <= 16);
+
+    if (useSimpleHeuristic) {
+        // Simplified heuristic: sort by distance and diversify with angular check
+        std::vector<std::pair<float, int>> scoredCandidates;
+        scoredCandidates.reserve(maxCandidates);
+
+        // First pass: calculate diversity scores
+        std::vector<float> minDistToSelected(maxCandidates, std::numeric_limits<float>::max());
+        std::vector<bool> selected(maxCandidates, false);
+
+        for (int i = 0; i < M && i < static_cast<int>(maxCandidates); ++i) {
+            int bestIdx = -1;
+            float bestScore = -1.0f;
+
+            for (size_t j = 0; j < maxCandidates; ++j) {
+                if (selected[j]) continue;
+
+                float distToQuery = candidates[j].first;
+                float diversity = minDistToSelected[j];
+
+                // Combined score: balance proximity and diversity
+                float score = 1.0f / (1.0f + distToQuery);
+                if (i > 0) {
+                    score += 0.3f * std::min(diversity, 10.0f) / 10.0f;
+                }
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestIdx = static_cast<int>(j);
+                }
+            }
+
+            if (bestIdx < 0) break;
+
+            selected[bestIdx] = true;
+            int selectedId = candidates[bestIdx].second;
+
+            // Update min distances for remaining candidates
+            const float* selectedVec = vectorStore_.getVector(selectedId);
+
+            // Batch prefetch for next iteration
+            for (size_t j = 0; j < maxCandidates; ++j) {
+                if (!selected[j]) {
+                    vectorStore_.prefetchVector(candidates[j].second);
+                }
+            }
+
+            for (size_t j = 0; j < maxCandidates; ++j) {
+                if (!selected[j]) {
+                    const float* candidateVec = vectorStore_.getVector(candidates[j].second);
+                    float d = distanceFunc_(selectedVec, candidateVec, dim);
+                    minDistToSelected[j] = std::min(minDistToSelected[j], d);
+                }
+            }
+        }
+
+        // Collect results
+        std::vector<int> result;
+        result.reserve(M);
+        for (size_t j = 0; j < maxCandidates && result.size() < static_cast<size_t>(M); ++j) {
+            if (selected[j]) {
+                result.push_back(candidates[j].second);
+            }
+        }
+        return result;
+    }
+
+    // Full heuristic for high dimensions: use angular diversity
+    std::vector<int> result;
+    result.reserve(M);
+    std::vector<bool> selected(maxCandidates, false);
+
+    // Precompute vector pointers for cache efficiency
+    std::vector<const float*> candidateVectors(maxCandidates);
+    for (size_t j = 0; j < maxCandidates; ++j) {
+        candidateVectors[j] = vectorStore_.getVector(candidates[j].second);
+    }
+
+    // Angular diversity check using dot products
+    auto computeCosineSimilarity = [&](const float* a, const float* b) -> float {
+        float dot = 0.0f, normA = 0.0f, normB = 0.0f;
+        for (int d = 0; d < dim; d++) {
+            dot += a[d] * b[d];
+            normA += a[d] * a[d];
+            normB += b[d] * b[d];
+        }
+        float denom = std::sqrt(normA * normB);
+        return denom > 1e-8f ? dot / denom : 0.0f;
+    };
 
     for (int i = 0; i < M && i < static_cast<int>(maxCandidates); ++i) {
         int bestIdx = -1;
@@ -312,23 +402,19 @@ std::vector<int> HNSWIndex::selectNeighborsHeuristic(const float* query,
         for (size_t j = 0; j < maxCandidates; ++j) {
             if (selected[j]) continue;
 
-            int candidateId = candidates[j].second;
-            float candidateDist = candidates[j].first;
+            float distToQuery = candidates[j].first;
+            const float* candidateVec = candidateVectors[j];
 
-            float minDistToSelected = std::numeric_limits<float>::max();
-            for (int selectedId : result) {
-                const float* selectedVec = vectorStore_.getVector(selectedId);
-                const float* candidateVec = vectorStore_.getVector(candidateId);
-                float d = distanceFunc_(selectedVec, candidateVec, vectorStore_.dimension());
-                minDistToSelected = std::min(minDistToSelected, d);
+            // Check angular diversity with already selected neighbors
+            float maxSimilarity = 0.0f;
+            for (int selectedIdx : result) {
+                float sim = computeCosineSimilarity(candidateVec, vectorStore_.getVector(selectedIdx));
+                maxSimilarity = std::max(maxSimilarity, std::abs(sim));
             }
 
-            float score;
-            if (result.empty()) {
-                score = 1.0f / (1.0f + candidateDist);
-            } else {
-                score = (1.0f / (1.0f + candidateDist)) + 0.5f * minDistToSelected;
-            }
+            // Score: closer to query is better, but penalize high similarity to selected
+            float diversityBonus = (1.0f - maxSimilarity) * 0.5f;
+            float score = 1.0f / (1.0f + distToQuery) + diversityBonus;
 
             if (score > bestScore) {
                 bestScore = score;
