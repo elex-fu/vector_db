@@ -482,12 +482,14 @@ public class HnswPqIndex implements VectorIndex {
         // HNSW插入逻辑
         int currentEntryPoint = entryPoint;
 
+        // Fix #4: 建图时使用精确距离，提升图结构质量
         for (int currentLevel = maxLevel - 1; currentLevel > level; currentLevel--) {
-            currentEntryPoint = searchLayerClosestCompressed(vector, currentEntryPoint, currentLevel);
+            currentEntryPoint = searchLayerClosest(vector, currentEntryPoint, currentLevel);
         }
 
         for (int currentLevel = Math.min(level, maxLevel - 1); currentLevel >= 0; currentLevel--) {
-            List<SearchResult> neighbors = searchLayerCompressed(vector, currentEntryPoint, efConstruction, currentLevel);
+            // 使用精确距离搜索邻居（建图质量更高）
+            List<SearchResult> neighbors = searchLayer(vector, currentEntryPoint, efConstruction, currentLevel);
             List<Integer> selectedNeighbors = selectNeighbors(vector, neighbors, m);
 
             graph.get(currentLevel).put(id, new ArrayList<>(selectedNeighbors));
@@ -597,7 +599,14 @@ public class HnswPqIndex implements VectorIndex {
             }
 
             Vector normalizedQuery = normalizeVector(queryVector);
-            int searchEf = Math.max(ef, k * 4);
+
+            // Fix #2: 优化efSearch计算，至少访问15%数据
+            int dataSize = vectors.size();
+            int minEfByRatio = (int) (dataSize * 0.15);  // 15%数据
+            int minEfByK = k * 100;  // 100倍k
+            int searchEf = Math.max(Math.max(minEfByRatio, minEfByK), ef);
+            searchEf = Math.min(searchEf, dataSize);  // 不超过数据总量
+            searchEf = Math.min(searchEf, 5000);  // 上限5000
 
             int currentEntryPoint = entryPoint;
 
@@ -607,9 +616,30 @@ public class HnswPqIndex implements VectorIndex {
                     currentEntryPoint = searchLayerClosestCompressed(normalizedQuery, currentEntryPoint, currentLevel);
                 }
 
-                // 底层使用精确距离
-                List<SearchResult> results = searchLayer(normalizedQuery, currentEntryPoint, searchEf, 0);
-                return results.size() <= k ? results : results.subList(0, k);
+                // Fix #3: 双层重排序策略
+                // Layer 1: 使用PQ距离收集更多候选
+                int candidatePoolSize = Math.min(k * 500, dataSize);  // 500倍候选池
+                List<SearchResult> candidates = searchLayerWithSize(normalizedQuery, currentEntryPoint, candidatePoolSize, 0);
+
+                // Layer 2: 对Top-(100*k)进行精确距离重排序
+                int firstLevelSize = Math.min(k * 100, candidates.size());
+                List<SearchResult> refinedCandidates = new ArrayList<>();
+
+                for (int i = 0; i < firstLevelSize; i++) {
+                    SearchResult candidate = candidates.get(i);
+                    Vector candidateVector = vectors.get(candidate.getId());
+                    if (candidateVector != null) {
+                        float exactDist = calculateDistance(normalizedQuery, candidateVector);
+                        refinedCandidates.add(new SearchResult(candidate.getId(), exactDist));
+                    }
+                }
+
+                // 按精确距离排序
+                refinedCandidates.sort(Comparator.comparing(SearchResult::getDistance));
+
+                // 返回Top-k
+                return refinedCandidates.size() <= k ?
+                        refinedCandidates : refinedCandidates.subList(0, k);
             } else {
                 for (int currentLevel = maxLevel - 1; currentLevel > 0; currentLevel--) {
                     currentEntryPoint = searchLayerClosest(normalizedQuery, currentEntryPoint, currentLevel);
@@ -830,6 +860,77 @@ public class HnswPqIndex implements VectorIndex {
             return results;
         } catch (Exception e) {
             log.error("搜索层时发生异常: {}", e.getMessage(), e);
+            return new ArrayList<>();
+        }
+    }
+
+    /**
+     * 搜索指定数量的候选结果（用于双层重排序）
+     * @param queryVector 查询向量
+     * @param entryPointId 入口点ID
+     * @param targetSize 目标候选数量
+     * @param level 层级
+     * @return 候选结果列表
+     */
+    private List<SearchResult> searchLayerWithSize(Vector queryVector, int entryPointId, int targetSize, int level) {
+        try {
+            if (!vectors.containsKey(entryPointId)) {
+                return new ArrayList<>();
+            }
+
+            PriorityQueue<SearchResult> resultSet = new PriorityQueue<>(
+                    Comparator.comparing(SearchResult::getDistance).reversed());
+            PriorityQueue<SearchResult> candidateSet = new PriorityQueue<>(
+                    Comparator.comparing(SearchResult::getDistance));
+
+            float distance = calculateDistance(vectors.get(entryPointId), queryVector);
+            SearchResult entryResult = new SearchResult(entryPointId, distance);
+            resultSet.add(entryResult);
+            candidateSet.add(entryResult);
+
+            Set<Integer> visited = new HashSet<>();
+            visited.add(entryPointId);
+
+            float furthestDistance = distance;
+
+            while (!candidateSet.isEmpty() && resultSet.size() < targetSize) {
+                SearchResult current = candidateSet.poll();
+                if (current == null) continue;
+
+                Map<Integer, List<Integer>> layerGraph = graph.get(level);
+                if (layerGraph == null) continue;
+
+                List<Integer> neighbors = layerGraph.get(current.getId());
+                if (neighbors == null || neighbors.isEmpty()) continue;
+
+                for (int neighborId : neighbors) {
+                    if (visited.contains(neighborId) || !vectors.containsKey(neighborId)) continue;
+
+                    visited.add(neighborId);
+
+                    Vector neighborVector = vectors.get(neighborId);
+                    if (neighborVector == null) continue;
+
+                    float neighborDistance = calculateDistance(neighborVector, queryVector);
+                    SearchResult neighborResult = new SearchResult(neighborId, neighborDistance);
+
+                    if (resultSet.size() < targetSize || neighborDistance < furthestDistance) {
+                        candidateSet.add(neighborResult);
+                        resultSet.add(neighborResult);
+
+                        if (resultSet.size() > targetSize) {
+                            resultSet.poll();
+                            furthestDistance = resultSet.peek().getDistance();
+                        }
+                    }
+                }
+            }
+
+            List<SearchResult> results = new ArrayList<>(resultSet);
+            results.sort(Comparator.comparing(SearchResult::getDistance));
+            return results;
+        } catch (Exception e) {
+            log.error("搜索层(指定大小)时发生异常: {}", e.getMessage(), e);
             return new ArrayList<>();
         }
     }

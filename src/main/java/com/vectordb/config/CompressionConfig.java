@@ -104,19 +104,70 @@ public class CompressionConfig {
     }
 
     /**
-     * 获取推荐的压缩配置
+     * 获取推荐的压缩配置 (高精度版本)
      * 根据向量维度自动计算最佳PQ子空间数量
+     * 目标: 每个子空间8维，平衡精度和压缩比
      *
      * @param dimension 向量维度
      * @return 推荐的压缩配置
      */
     public static CompressionConfig recommendedConfig(int dimension) {
-        // 自动计算PQ子空间数量，使每个子空间约2-4维
-        int pqSubspaces = Math.max(8, dimension / 2);
+        // 优化: 每个子空间8维，减少量化误差
+        // 原实现: dimension/2 = 2维/子空间 (量化误差大)
+        // 新实现: dimension/8 = 8维/子空间 (量化误差小)
+        int targetSubDim = 8;
+        int pqSubspaces = dimension / targetSubDim;
+
+        // 确保至少8个子空间
+        pqSubspaces = Math.max(8, pqSubspaces);
+
         // 确保dimension能被pqSubspaces整除
         while (dimension % pqSubspaces != 0 && pqSubspaces > 1) {
             pqSubspaces--;
         }
+
+        return hnswPqConfig(pqSubspaces, 8);
+    }
+
+    /**
+     * 获取高召回率配置 (低压缩比，高精度)
+     * 每个子空间仅4维，量化误差更小
+     *
+     * @param dimension 向量维度
+     * @return 高召回率配置
+     */
+    public static CompressionConfig highRecallConfig(int dimension) {
+        // 每个子空间4维，精度更高
+        int targetSubDim = 4;
+        int pqSubspaces = dimension / targetSubDim;
+
+        pqSubspaces = Math.max(16, pqSubspaces);
+
+        while (dimension % pqSubspaces != 0 && pqSubspaces > 1) {
+            pqSubspaces--;
+        }
+
+        return hnswPqConfig(pqSubspaces, 8);
+    }
+
+    /**
+     * 获取高压缩比配置 (高压缩比，稍低精度)
+     * 每个子空间16维，压缩比更高
+     *
+     * @param dimension 向量维度
+     * @return 高压缩比配置
+     */
+    public static CompressionConfig highCompressionConfig(int dimension) {
+        // 每个子空间16维，压缩比更高
+        int targetSubDim = 16;
+        int pqSubspaces = dimension / targetSubDim;
+
+        pqSubspaces = Math.max(4, pqSubspaces);
+
+        while (dimension % pqSubspaces != 0 && pqSubspaces > 1) {
+            pqSubspaces--;
+        }
+
         return hnswPqConfig(pqSubspaces, 8);
     }
 
