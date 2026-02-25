@@ -1,4 +1,5 @@
 #include "HNSWIndex.h"
+#include "../compute/BatchDistance.h"
 #include <algorithm>
 #include <queue>
 #include <cmath>
@@ -7,8 +8,12 @@
 #include <limits>
 #include <thread>
 #include <future>
+#include <cstring>
 
 namespace vectordb {
+
+// Threshold for using batch distance computation - lowered for better performance
+static constexpr int BATCH_DISTANCE_THRESHOLD = 8;
 
 typedef std::pair<float, int> DistIdPair;
 
@@ -222,40 +227,72 @@ void HNSWIndex::searchLevel(const float* query, int entryPoint, int ef, int leve
         }
 
         const auto& neighbors = nodes_[curr.second].neighbors[level];
+        const int dim = vectorStore_.dimension();
 
-        // Aggressive prefetching - prefetch first 8 neighbors
-        const size_t prefetchCount = std::min(size_t(8), neighbors.size());
-        for (size_t ni = 0; ni < prefetchCount; ++ni) {
-            vectorStore_.prefetchVector(neighbors[ni]);
+        // Collect all unvisited neighbors first
+        thread_local std::vector<int> unvisitedNeighbors;
+        thread_local std::vector<float> batchDistances;
+        thread_local std::vector<float> vectorBuffer;
+        unvisitedNeighbors.clear();
+
+        for (int neighbor : neighbors) {
+            if (visited.insert(neighbor).second) {
+                unvisitedNeighbors.push_back(neighbor);
+            }
         }
 
-        for (size_t ni = 0; ni < neighbors.size(); ++ni) {
-            int neighbor = neighbors[ni];
+        if (unvisitedNeighbors.empty()) continue;
 
-            // Prefetch next batch while processing current
-            if (ni + 8 < neighbors.size()) {
-                vectorStore_.prefetchVector(neighbors[ni + 8]);
+        // Use batch distance computation for larger batches
+        if (static_cast<int>(unvisitedNeighbors.size()) >= BATCH_DISTANCE_THRESHOLD) {
+            // Gather vectors into contiguous buffer
+            vectorBuffer.resize(unvisitedNeighbors.size() * dim);
+            for (size_t i = 0; i < unvisitedNeighbors.size(); ++i) {
+                const float* vec = vectorStore_.getVector(unvisitedNeighbors[i]);
+                std::memcpy(vectorBuffer.data() + i * dim, vec, dim * sizeof(float));
             }
 
-            if (visited.count(neighbor)) continue;
-            visited.insert(neighbor);
+            // Batch compute distances using BLAS/Accelerate
+            batchDistances.resize(unvisitedNeighbors.size());
+            batchEuclideanDistance(query, vectorBuffer.data(),
+                                   unvisitedNeighbors.size(), dim, batchDistances.data());
 
-            float d = computeDistance(query, neighbor);
+            // Process results
+            for (size_t i = 0; i < unvisitedNeighbors.size(); ++i) {
+                float d = batchDistances[i];
 
-            if (config_.distanceThreshold > 0 && d > config_.distanceThreshold) {
-                continue;
-            }
-
-            if (bestResults.size() < static_cast<size_t>(ef) || d < lowerBound) {
-                candidates.emplace(d, neighbor);
-                bestResults.emplace(d, neighbor);
-
-                if (bestResults.size() > static_cast<size_t>(ef)) {
-                    bestResults.pop();
+                if (config_.distanceThreshold > 0 && d > config_.distanceThreshold) {
+                    continue;
                 }
 
-                if (!bestResults.empty()) {
-                    lowerBound = bestResults.top().first;
+                if (bestResults.size() < static_cast<size_t>(ef) || d < lowerBound) {
+                    int neighbor = unvisitedNeighbors[i];
+                    candidates.emplace(d, neighbor);
+                    bestResults.emplace(d, neighbor);
+
+                    if (bestResults.size() > static_cast<size_t>(ef)) {
+                        bestResults.pop();
+                        lowerBound = bestResults.top().first;
+                    }
+                }
+            }
+        } else {
+            // For small batches, use individual distance computation
+            for (int neighbor : unvisitedNeighbors) {
+                float d = computeDistance(query, neighbor);
+
+                if (config_.distanceThreshold > 0 && d > config_.distanceThreshold) {
+                    continue;
+                }
+
+                if (bestResults.size() < static_cast<size_t>(ef) || d < lowerBound) {
+                    candidates.emplace(d, neighbor);
+                    bestResults.emplace(d, neighbor);
+
+                    if (bestResults.size() > static_cast<size_t>(ef)) {
+                        bestResults.pop();
+                        lowerBound = bestResults.top().first;
+                    }
                 }
             }
         }

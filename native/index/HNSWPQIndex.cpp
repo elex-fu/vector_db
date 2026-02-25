@@ -1,4 +1,5 @@
 #include "HNSWPQIndex.h"
+#include "../compute/ADCUtils.h"
 #include <algorithm>
 #include <queue>
 #include <cmath>
@@ -7,6 +8,7 @@
 #include <limits>
 #include <thread>
 #include <future>
+#include <cstring>
 
 namespace vectordb {
 
@@ -429,6 +431,9 @@ void HNSWPQIndex::search(const float* query, int k,
         }
     }
 
+    // Get optimized ADC function
+    ADCDistanceFunc adcFunc = getADCDistanceFunc();
+
     // Beam search using distance table
     candidates.emplace(0.0f, currObj);
     float lowerBound = 0.0f;
@@ -438,23 +443,54 @@ void HNSWPQIndex::search(const float* query, int k,
         candidates.pop();
 
         const auto& neighbors = nodes_[curr.second].neighbors[0];
+
+        // Collect unvisited neighbors
+        std::vector<int> unvisitedNeighbors;
         for (int neighbor : neighbors) {
-            if (visited.insert(neighbor).second) {
-                // Fast ADC using precomputed table
-                float d = 0.0f;
+            if (visited.find(neighbor) == visited.end()) {
+                unvisitedNeighbors.push_back(neighbor);
+            }
+        }
+
+        // Mark all as visited
+        for (int neighbor : unvisitedNeighbors) {
+            visited.insert(neighbor);
+        }
+
+        // Process neighbors - use batch ADC for larger groups
+        const int ADC_BATCH_SIZE = 16;
+        for (size_t i = 0; i < unvisitedNeighbors.size(); i += ADC_BATCH_SIZE) {
+            size_t batchEnd = std::min(i + ADC_BATCH_SIZE, unvisitedNeighbors.size());
+            size_t batchCount = batchEnd - i;
+
+            // Collect codes for batch processing
+            thread_local std::vector<uint8_t> batchCodes;
+            batchCodes.resize(batchCount * config_.pqM);
+
+            for (size_t j = 0; j < batchCount; j++) {
+                int neighbor = unvisitedNeighbors[i + j];
                 const uint8_t* neighborCodes = codes_.data() + static_cast<size_t>(neighbor) * config_.pqM;
-                for (int m = 0; m < config_.pqM; m++) {
-                    d += distanceTable[m * nCentroids_ + neighborCodes[m]];
-                }
+                std::memcpy(batchCodes.data() + j * config_.pqM, neighborCodes, config_.pqM);
+            }
+
+            // Batch compute ADC distances using SIMD
+            thread_local std::vector<float> batchDists;
+            batchDists.resize(batchCount);
+            ADCDistanceBatchFunc adcBatchFunc = getADCDistanceBatchFunc();
+            adcBatchFunc(distanceTable.data(), batchCodes.data(), static_cast<int>(batchCount),
+                        config_.pqM, nCentroids_, batchDists.data());
+
+            // Process results
+            for (size_t j = 0; j < batchCount; j++) {
+                float d = batchDists[j];
 
                 if (bestResults.size() < static_cast<size_t>(k) || d < lowerBound) {
+                    int neighbor = unvisitedNeighbors[i + j];
                     candidates.emplace(d, neighbor);
                     bestResults.emplace(d, neighbor);
 
                     if (bestResults.size() > static_cast<size_t>(k)) {
                         bestResults.pop();
-                    }
-                    if (!bestResults.empty()) {
                         lowerBound = bestResults.top().first;
                     }
                 }

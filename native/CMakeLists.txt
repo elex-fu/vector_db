@@ -43,6 +43,7 @@ set(COMPUTE_SOURCES
     compute/DistanceAVX2.cpp
     compute/SIMDDispatcher.cpp
     compute/BatchDistance.cpp
+    compute/ADCUtils.cpp
 )
 
 set(INDEX_SOURCES
@@ -51,6 +52,7 @@ set(INDEX_SOURCES
     index/IVFIndex.cpp
     index/LSHIndex.cpp
     index/AnnoyIndex.cpp
+    index/HNSWPQIndex.cpp
 )
 
 set(BRIDGE_SOURCES
@@ -61,6 +63,7 @@ set(TEST_SOURCES
     test/test_hnsw.cpp
     test/test_simple.cpp
     test/test_performance.cpp
+    test/test_hnswpq.cpp
 )
 
 # JNI支持 (可选)
