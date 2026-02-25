@@ -11,6 +11,16 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fPIC -Wall -Wextra")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address -fno-omit-frame-pointer")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=core-avx2")
 
+# OpenMP 支持
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP found: ${OpenMP_CXX_FLAGS}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+    add_definitions(-DHAVE_OPENMP)
+else()
+    message(STATUS "OpenMP not found, building without parallel support")
+endif()
+
 # 检测平台
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(X86_64 ON)

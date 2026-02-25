@@ -74,8 +74,9 @@ TEST_F(HNSWPQTest, PerformanceBenchmark) {
     const int maxElements = 10000;
 
     HNSWPQConfig config;
-    config.pqM = 8;
-    config.pqBits = 8;
+    config.pqM = 64;           // 128维/64=2维/子空间，更高精度
+    config.pqBits = 8;         // 256个聚类中心
+    config.efSearch = 128;     // 更大efSearch提升Recall
 
     HNSWPQIndex index(dim, maxElements, config);
 
@@ -148,7 +149,13 @@ TEST_F(HNSWPQTest, CompareWithHNSW) {
 
     // Build both indexes
     HNSWIndex hnswIndex(dim, nVectors + 100);
-    HNSWPQIndex hnswPqIndex(dim, nVectors + 100);
+
+    // Use optimized PQ configuration for high recall (>90%)
+    HNSWPQConfig pqConfig;
+    pqConfig.pqM = 64;        // 128/64=2 dims per subspace, high precision
+    pqConfig.pqBits = 8;      // 256 centroids per subspace
+    pqConfig.efSearch = 128;  // Larger ef for better recall
+    HNSWPQIndex hnswPqIndex(dim, nVectors + 100, pqConfig);
 
     // Generate data
     std::vector<std::vector<float>> vectors;

@@ -28,9 +28,9 @@ struct HNSWPQConfig {
     double levelMultiplier = 1.0 / std::log(1.0 * 32);
     bool useHeuristicSelection = true;
 
-    // PQ 参数
-    int pqM = 8;           // PQ 子空间数量
-    int pqBits = 8;        // 每个子空间的位数
+    // PQ 参数 - 优化为更高精度
+    int pqM = 64;          // PQ 子空间数量 (128维/64=2维/子空间，更高精度)
+    int pqBits = 8;        // 每个子空间的位数 (256个聚类中心)
     int pqIterations = 25; // KMeans 迭代次数
 };
 
@@ -70,7 +70,9 @@ private:
     std::atomic<int> entryPoint_{-1};
     std::mt19937 rng_;
     mutable std::shared_mutex mutex_;
+    mutable std::vector<std::unique_ptr<std::shared_mutex>> bucketMutexes_;  // 细粒度锁
     bool trained_ = false;
+    static constexpr int NUM_BUCKETS = 64;  // 桶数量，用于细粒度锁
 
     // PQ 数据
     int subDim_ = 0;
@@ -78,12 +80,23 @@ private:
     std::vector<float> codebooks_;  // [pqM][nCentroids][subDim]
     std::vector<uint8_t> codes_;    // [nVectors][pqM]
 
-    // HNSW 图结构
+    // 内存池优化的邻居存储
+    struct NeighborLevel {
+        int* data;           // 邻居ID数组（内存池分配）
+        uint16_t size;       // 当前邻居数量
+        uint16_t capacity;   // 容量
+    };
+
     struct Node {
         int level;
-        std::vector<std::vector<int>> neighbors;
+        NeighborLevel* levels;  // 每层邻居数组（内存池分配）
     };
     std::vector<Node> nodes_;
+
+    // 内存池
+    std::vector<int> neighborPool_;       // 邻居ID内存池
+    size_t neighborPoolUsed_ = 0;         // 已使用大小
+    static constexpr size_t NEIGHBOR_POOL_BLOCK_SIZE = 1024;  // 每次扩容大小
 
     // 原始向量存储 (可选，用于 refine)
     VectorStore vectorStore_;
@@ -100,6 +113,7 @@ private:
     void encode(const float* vector, uint8_t* codes);
     float computeDistancePQ(const float* query, int nodeId);
     float computeExactDistance(int idA, int idB);
+    float computeExactDistanceToQuery(const float* query, int nodeId);
 
     void searchLevel(const float* query, const uint8_t* queryCodes,
                      int entryPoint, int ef, int level,
@@ -111,6 +125,17 @@ private:
 
     void connectNeighbors(int newId, const std::vector<int>& neighbors, int level);
     void pruneNeighbors(int nodeId, int level);
+
+    // 锁优化辅助函数
+    std::shared_mutex& getBucketMutex(int nodeId);
+    void lockBuckets(const std::vector<int>& nodeIds);
+    void unlockBuckets(const std::vector<int>& nodeIds);
+
+    // 内存池辅助函数
+    NeighborLevel* allocateNeighborLevels(int levelCount);
+    void addNeighborToLevel(int nodeId, int level, int neighborId);
+    void clearNeighborLevel(int nodeId, int level);
+    void reserveNeighborPool(size_t totalNeighbors);
 
     // PQ 训练
     void trainSubspace(int subspaceIdx, int nSamples, const float* samples);
