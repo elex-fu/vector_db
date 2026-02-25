@@ -1,5 +1,6 @@
 package com.vectordb.index;
 
+import com.vectordb.config.CompressionConfig;
 import com.vectordb.core.SearchResult;
 import com.vectordb.core.Vector;
 
@@ -44,24 +45,87 @@ public class PqIndex implements VectorIndex {
     
     /**
      * 创建PQ索引（带参数）
-     * 
+     *
      * @param dimension 向量维度
      * @param maxElements 最大元素数量
      * @param numSubvectors 子向量数量
      * @param numClusters 每个子空间的聚类数量（通常为256，使用一个字节表示）
      */
     public PqIndex(int dimension, int maxElements, int numSubvectors, int numClusters) {
+        this(dimension, maxElements, createCompressionConfig(dimension, numSubvectors, numClusters));
+    }
+
+    /**
+     * 创建PQ索引（带压缩配置）
+     *
+     * @param dimension 向量维度
+     * @param maxElements 最大元素数量
+     * @param compressionConfig 压缩配置
+     */
+    public PqIndex(int dimension, int maxElements, CompressionConfig compressionConfig) {
         this.dimension = dimension;
         this.maxElements = maxElements;
-        this.numSubvectors = Math.min(numSubvectors, dimension);
-        this.numClusters = Math.min(numClusters, 256); // 最多256个聚类，用一个字节表示
-        
+
+        // 确保dimension能被pqSubspaces整除
+        int pqSubspaces = compressionConfig.getPqSubspaces();
+        if (dimension % pqSubspaces != 0) {
+            pqSubspaces = findBestSubspaceDivisor(dimension, pqSubspaces);
+            log.warn("维度{}不能被PQ子空间数{}整除，自动调整为{}",
+                    dimension, compressionConfig.getPqSubspaces(), pqSubspaces);
+        }
+
+        this.numSubvectors = pqSubspaces;
+        this.numClusters = Math.min(1 << compressionConfig.getPqBits(), 256);
+
         // 计算每个子向量的维度
         this.subvectorDim = dimension / this.numSubvectors;
-        
+
         this.vectors = new ConcurrentHashMap<>(maxElements);
         this.codes = new ConcurrentHashMap<>(maxElements);
         this.centroids = new float[this.numSubvectors][this.numClusters][subvectorDim];
+
+        log.info("创建PQ索引: 维度={}, 子空间数={}, 聚类数={}, 压缩比={:.2f}x",
+                dimension, numSubvectors, numClusters,
+                compressionConfig.getCompressionRatio(dimension));
+    }
+
+    /**
+     * 从参数创建压缩配置
+     */
+    private static CompressionConfig createCompressionConfig(int dimension, int numSubvectors, int numClusters) {
+        int pqBits = 8;
+        while ((1 << pqBits) < numClusters && pqBits < 8) {
+            pqBits++;
+        }
+        return CompressionConfig.builder()
+                .enabled(true)
+                .type(CompressionConfig.CompressionType.PQ)
+                .pqSubspaces(numSubvectors)
+                .pqBits(pqBits)
+                .pqIterations(25)
+                .build();
+    }
+
+    /**
+     * 查找最佳的子空间除数
+     */
+    private int findBestSubspaceDivisor(int dimension, int preferredSubspaces) {
+        // 首先尝试preferredSubspaces附近能整除的值
+        for (int offset = 0; offset < preferredSubspaces; offset++) {
+            if (preferredSubspaces - offset > 0 && dimension % (preferredSubspaces - offset) == 0) {
+                return preferredSubspaces - offset;
+            }
+            if (dimension % (preferredSubspaces + offset) == 0) {
+                return preferredSubspaces + offset;
+            }
+        }
+        //  fallback到最大公约数
+        for (int subspaces = Math.min(dimension, 128); subspaces >= 8; subspaces--) {
+            if (dimension % subspaces == 0) {
+                return subspaces;
+            }
+        }
+        return dimension;
     }
     
     /**

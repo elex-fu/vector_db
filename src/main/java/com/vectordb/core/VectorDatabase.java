@@ -1,7 +1,9 @@
 package com.vectordb.core;
 
+import com.vectordb.config.CompressionConfig;
 import com.vectordb.index.AnnoyIndex;
 import com.vectordb.index.HnswIndex;
+import com.vectordb.index.HnswPqIndex;
 import com.vectordb.index.IvfIndex;
 import com.vectordb.index.LshIndex;
 import com.vectordb.index.PqIndex;
@@ -21,11 +23,12 @@ import lombok.extern.slf4j.Slf4j;
 public class VectorDatabase implements Closeable {
     // 索引类型枚举
     public enum IndexType {
-        HNSW,   // 层次可导航小世界图索引
-        ANNOY,  // 近似最近邻哦耶索引
-        LSH,    // 局部敏感哈希索引
-        IVF,    // 倒排文件索引
-        PQ      // 乘积量化索引
+        HNSW,     // 层次可导航小世界图索引
+        ANNOY,    // 近似最近邻哦耶索引
+        LSH,      // 局部敏感哈希索引
+        IVF,      // 倒排文件索引
+        PQ,       // 乘积量化索引
+        HNSWPQ    // HNSW + PQ 混合索引 (支持压缩)
     }
     
     private final int dimension;
@@ -33,6 +36,7 @@ public class VectorDatabase implements Closeable {
     private final String storagePath;
     private final VectorIndex index;
     private final VectorStorage storage;
+    private final CompressionConfig compressionConfig;
     
     /**
      * 使用Builder模式创建VectorDatabase实例
@@ -41,38 +45,61 @@ public class VectorDatabase implements Closeable {
         this.dimension = builder.dimension;
         this.maxElements = builder.maxElements;
         this.storagePath = builder.storagePath;
-        
+        this.compressionConfig = builder.compressionConfig != null ?
+                builder.compressionConfig :
+                CompressionConfig.defaultConfig();
+
         // 初始化存储
-        this.storage = builder.storage != null ? 
-                builder.storage : 
+        this.storage = builder.storage != null ?
+                builder.storage :
                 new VectorStorage(storagePath, dimension, maxElements);
-        
+
         // 根据索引类型初始化索引
         if (builder.index != null) {
             this.index = builder.index;
         } else {
-            switch (builder.indexType) {
-                case ANNOY:
-                    this.index = new AnnoyIndex(dimension, maxElements);
-                    break;
-                case LSH:
-                    this.index = new LshIndex(dimension, maxElements);
-                    break;
-                case IVF:
-                    this.index = new IvfIndex(dimension, maxElements);
-                    break;
-                case PQ:
-                    this.index = new PqIndex(dimension, maxElements);
-                    break;
-                case HNSW:
-                default:
-                    this.index = new HnswIndex(dimension, maxElements);
-                    break;
-            }
+            this.index = createIndex(builder.indexType, this.compressionConfig);
         }
-        
+
         // 从存储加载数据到索引
         loadFromStorage();
+    }
+
+    /**
+     * 根据索引类型和压缩配置创建索引实例
+     */
+    private VectorIndex createIndex(IndexType indexType, CompressionConfig compression) {
+        // 如果启用了压缩且使用HNSWPQ类型，创建HNSW+PQ混合索引
+        if (compression.isEnabled() && compression.getType() == CompressionConfig.CompressionType.HNSWPQ) {
+            log.info("创建HNSW+PQ混合索引，PQ子空间数: {}, 位数: {}",
+                    compression.getPqSubspaces(), compression.getPqBits());
+            return new HnswPqIndex(dimension, maxElements, compression);
+        }
+
+        // 如果启用了压缩且使用PQ类型，创建纯PQ索引
+        if (compression.isEnabled() && compression.getType() == CompressionConfig.CompressionType.PQ) {
+            log.info("创建PQ索引，PQ子空间数: {}, 位数: {}",
+                    compression.getPqSubspaces(), compression.getPqBits());
+            return new PqIndex(dimension, maxElements, compression);
+        }
+
+        // 默认根据indexType创建索引
+        switch (indexType) {
+            case ANNOY:
+                return new AnnoyIndex(dimension, maxElements);
+            case LSH:
+                return new LshIndex(dimension, maxElements);
+            case IVF:
+                return new IvfIndex(dimension, maxElements);
+            case PQ:
+                return new PqIndex(dimension, maxElements);
+            case HNSWPQ:
+                // 即使压缩未启用，也允许显式使用HNSWPQ索引（使用默认PQ配置）
+                return new HnswPqIndex(dimension, maxElements, CompressionConfig.recommendedConfig(dimension));
+            case HNSW:
+            default:
+                return new HnswIndex(dimension, maxElements);
+        }
     }
     
     /**
@@ -84,14 +111,32 @@ public class VectorDatabase implements Closeable {
      * @param storage 向量存储实例
      * @param index 向量索引实例
      */
-    public VectorDatabase(int dimension, int maxElements, String storagePath, 
+    public VectorDatabase(int dimension, int maxElements, String storagePath,
                           VectorStorage storage, VectorIndex index) {
+        this(dimension, maxElements, storagePath, storage, index, CompressionConfig.defaultConfig());
+    }
+
+    /**
+     * 直接使用预先创建的存储和索引创建VectorDatabase实例，带压缩配置
+     *
+     * @param dimension 向量维度
+     * @param maxElements 最大元素数量
+     * @param storagePath 存储路径
+     * @param storage 向量存储实例
+     * @param index 向量索引实例
+     * @param compressionConfig 压缩配置
+     */
+    public VectorDatabase(int dimension, int maxElements, String storagePath,
+                          VectorStorage storage, VectorIndex index,
+                          CompressionConfig compressionConfig) {
         this.dimension = dimension;
         this.maxElements = maxElements;
         this.storagePath = storagePath;
         this.storage = storage;
         this.index = index;
-        
+        this.compressionConfig = compressionConfig != null ?
+                compressionConfig : CompressionConfig.defaultConfig();
+
         // 从存储加载数据到索引
         loadFromStorage();
     }
@@ -193,11 +238,41 @@ public class VectorDatabase implements Closeable {
     
     /**
      * 获取当前使用的索引类型
-     * 
+     *
      * @return 索引类型
      */
     public String getIndexType() {
         return index.getClass().getSimpleName();
+    }
+
+    /**
+     * 获取压缩配置
+     *
+     * @return 压缩配置
+     */
+    public CompressionConfig getCompressionConfig() {
+        return compressionConfig;
+    }
+
+    /**
+     * 检查是否启用了压缩
+     *
+     * @return 是否启用压缩
+     */
+    public boolean isCompressionEnabled() {
+        return compressionConfig != null && compressionConfig.isEnabled();
+    }
+
+    /**
+     * 获取当前压缩比
+     *
+     * @return 压缩比，如果未启用压缩则返回1.0
+     */
+    public double getCompressionRatio() {
+        if (compressionConfig == null) {
+            return 1.0;
+        }
+        return compressionConfig.getCompressionRatio(dimension);
     }
     
     /**
@@ -255,25 +330,26 @@ public class VectorDatabase implements Closeable {
         private IndexType indexType = IndexType.HNSW; // 默认使用HNSW索引
         private VectorStorage storage;
         private VectorIndex index;
-        
+        private CompressionConfig compressionConfig;
+
         public Builder withDimension(int dimension) {
             this.dimension = dimension;
             return this;
         }
-        
+
         public Builder withMaxElements(int maxElements) {
             this.maxElements = maxElements;
             return this;
         }
-        
+
         public Builder withStoragePath(String storagePath) {
             this.storagePath = storagePath;
             return this;
         }
-        
+
         /**
          * 设置索引类型
-         * 
+         *
          * @param indexType 索引类型
          * @return Builder实例
          */
@@ -281,17 +357,53 @@ public class VectorDatabase implements Closeable {
             this.indexType = indexType;
             return this;
         }
-        
+
+        /**
+         * 设置压缩配置
+         *
+         * @param config 压缩配置
+         * @return Builder实例
+         */
+        public Builder withCompression(CompressionConfig config) {
+            this.compressionConfig = config;
+            return this;
+        }
+
+        /**
+         * 启用压缩（使用推荐配置）
+         *
+         * @return Builder实例
+         */
+        public Builder withCompressionEnabled() {
+            this.compressionConfig = CompressionConfig.recommendedConfig(this.dimension);
+            return this;
+        }
+
+        /**
+         * 设置是否启用压缩
+         *
+         * @param enabled 是否启用
+         * @return Builder实例
+         */
+        public Builder withCompressionEnabled(boolean enabled) {
+            if (enabled) {
+                this.compressionConfig = CompressionConfig.recommendedConfig(this.dimension);
+            } else {
+                this.compressionConfig = CompressionConfig.defaultConfig();
+            }
+            return this;
+        }
+
         public Builder withStorage(VectorStorage storage) {
             this.storage = storage;
             return this;
         }
-        
+
         public Builder withIndex(VectorIndex index) {
             this.index = index;
             return this;
         }
-        
+
         public VectorDatabase build() {
             return new VectorDatabase(this);
         }
