@@ -8,6 +8,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <atomic>
+#include <unordered_set>
 
 namespace vectordb {
 
@@ -85,6 +86,11 @@ private:
     std::vector<Node> nodes_;
     DistanceFunc distanceFunc_;
     int numThreads_ = 4;
+
+    // Thread-local visited array to avoid repeated allocation
+    mutable std::vector<std::unordered_set<int>> threadVisited_;
+    mutable std::vector<int> visitedVersion_;
+    mutable std::atomic<int> currentVersion_{0};
 
     int getRandomLevel();
     void searchLevel(const float* query, int entryPoint, int ef, int level,

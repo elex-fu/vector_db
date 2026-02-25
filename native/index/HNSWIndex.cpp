@@ -27,6 +27,11 @@ HNSWIndex::HNSWIndex(int dimension, int maxElements, const HNSWConfig& config)
     nodes_.reserve(maxElements);
     unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
     rng_.seed(seed);
+
+    // Pre-allocate thread-local visited tracking
+    int maxThreads = std::max(4, static_cast<int>(std::thread::hardware_concurrency()));
+    threadVisited_.resize(maxThreads);
+    visitedVersion_.resize(maxElements, 0);
 }
 
 void HNSWIndex::add(int id, const float* vector) {
@@ -56,7 +61,6 @@ void HNSWIndex::add(int id, const float* vector) {
         while (changed) {
             changed = false;
 
-            // Check bounds before accessing neighbors - removed nested lock since we already hold unique_lock
             if (currObj < 0 || currObj >= static_cast<int>(nodes_.size())) break;
             if (currLevel > nodes_[currObj].level) break;
 
@@ -70,9 +74,7 @@ void HNSWIndex::add(int id, const float* vector) {
                 }
             }
         }
-        // Move down to the next level
         currLevel--;
-        // Update currLevel if the current node has a lower level
         if (currObj >= 0 && currObj < static_cast<int>(nodes_.size())) {
             currLevel = std::min(currLevel, nodes_[currObj].level);
         }
@@ -129,7 +131,6 @@ void HNSWIndex::search(const float* query, int k,
         bool changed = true;
         while (changed) {
             changed = false;
-            // Check bounds before accessing neighbors
             if (currObj < 0 || currObj >= static_cast<int>(nodes_.size())) break;
             if (currLevel > nodes_[currObj].level) break;
 
@@ -144,7 +145,6 @@ void HNSWIndex::search(const float* query, int k,
             }
         }
         currLevel--;
-        // Update currLevel to match current node's level
         if (currObj >= 0 && currObj < static_cast<int>(nodes_.size())) {
             currLevel = std::min(currLevel, nodes_[currObj].level);
         }
@@ -167,8 +167,16 @@ void HNSWIndex::searchLevel(const float* query, int entryPoint, int ef, int leve
                             std::vector<DistIdPair>& results) {
     std::priority_queue<DistIdPair, std::vector<DistIdPair>, CompareByFirst> candidates;
     std::priority_queue<DistIdPair> bestResults;
-    // Use capacity instead of size_ to avoid out-of-bounds during construction
-    std::vector<bool> visited(vectorStore_.capacity(), false);
+
+    // Get thread ID for thread-local storage
+    static thread_local int threadId = -1;
+    if (threadId == -1) {
+        static std::atomic<int> nextId{0};
+        threadId = nextId++ % threadVisited_.size();
+    }
+
+    auto& visited = threadVisited_[threadId];
+    visited.clear();
 
     float dist = computeDistance(query, entryPoint);
 
@@ -179,18 +187,20 @@ void HNSWIndex::searchLevel(const float* query, int entryPoint, int ef, int leve
 
     candidates.emplace(dist, entryPoint);
     bestResults.emplace(dist, entryPoint);
-    visited[entryPoint] = true;
+    visited.insert(entryPoint);
 
     float lowerBound = dist;
     int expansionCount = 0;
     const int maxExpansions = config_.getMaxExpansions(ef);
+
+    // Pre-allocate neighbor buffer for better cache utilization
+    std::vector<int> neighborBuffer;
 
     while (!candidates.empty()) {
         auto curr = candidates.top();
         candidates.pop();
         expansionCount++;
 
-        // Check bounds for curr.second
         if (curr.second < 0 || curr.second >= vectorStore_.size()) {
             continue;
         }
@@ -207,25 +217,28 @@ void HNSWIndex::searchLevel(const float* query, int entryPoint, int ef, int leve
             break;
         }
 
-        // Check if level is valid for this node
         if (level >= static_cast<int>(nodes_[curr.second].neighbors.size())) {
             continue;
         }
 
         const auto& neighbors = nodes_[curr.second].neighbors[level];
-        for (size_t ni = 0; ni < std::min(size_t(4), neighbors.size()); ++ni) {
+
+        // Aggressive prefetching - prefetch first 8 neighbors
+        const size_t prefetchCount = std::min(size_t(8), neighbors.size());
+        for (size_t ni = 0; ni < prefetchCount; ++ni) {
             vectorStore_.prefetchVector(neighbors[ni]);
         }
 
         for (size_t ni = 0; ni < neighbors.size(); ++ni) {
             int neighbor = neighbors[ni];
 
-            if (ni + 4 < neighbors.size()) {
-                vectorStore_.prefetchVector(neighbors[ni + 4]);
+            // Prefetch next batch while processing current
+            if (ni + 8 < neighbors.size()) {
+                vectorStore_.prefetchVector(neighbors[ni + 8]);
             }
 
-            if (visited[neighbor]) continue;
-            visited[neighbor] = true;
+            if (visited.count(neighbor)) continue;
+            visited.insert(neighbor);
 
             float d = computeDistance(query, neighbor);
 
@@ -249,6 +262,7 @@ void HNSWIndex::searchLevel(const float* query, int entryPoint, int ef, int leve
     }
 
     results.clear();
+    results.reserve(bestResults.size());
     while (!bestResults.empty()) {
         results.push_back(bestResults.top());
         bestResults.pop();
@@ -285,6 +299,11 @@ std::vector<int> HNSWIndex::selectNeighborsHeuristic(const float* query,
 
     const size_t maxCandidates = std::min(static_cast<size_t>(M * 8), candidates.size());
     std::vector<bool> selected(maxCandidates, false);
+
+    // Pre-fetch all candidate vectors for cache efficiency
+    for (size_t j = 0; j < maxCandidates; ++j) {
+        vectorStore_.prefetchVector(candidates[j].second);
+    }
 
     for (int i = 0; i < M && i < static_cast<int>(maxCandidates); ++i) {
         int bestIdx = -1;
@@ -351,6 +370,12 @@ void HNSWIndex::pruneNeighbors(int nodeId, int level) {
 
     std::vector<DistIdPair> neighborDists;
     neighborDists.reserve(links.size());
+
+    // Batch prefetch before computing distances
+    for (size_t i = 0; i < links.size(); ++i) {
+        vectorStore_.prefetchVector(links[i]);
+    }
+
     for (int neighborId : links) {
         const float* neighborVec = vectorStore_.getVector(neighborId);
         float d = distanceFunc_(nodeVec, neighborVec, vectorStore_.dimension());

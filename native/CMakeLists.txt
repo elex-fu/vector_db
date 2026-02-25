@@ -59,6 +59,7 @@ set(BRIDGE_SOURCES
 set(TEST_SOURCES
     test/test_hnsw.cpp
     test/test_simple.cpp
+    test/test_performance.cpp
 )
 
 # JNI支持 (可选)
