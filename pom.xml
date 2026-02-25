@@ -19,6 +19,13 @@
         <jackson.version>2.13.0</jackson.version>
         <junit.version>4.13.2</junit.version>
         <lombok.version>1.18.30</lombok.version>
+        <native-lib-loader.version>2.3.6</native-lib-loader.version>
+        <!-- 默认不跳过 native 编译，可通过 -DskipNative=true 跳过 -->
+        <skipNative>false</skipNative>
+        <!-- SCM 信息 -->
+        <scm.url>https://github.com/vectordb/vector-database</scm.url>
+        <scm.connection>scm:git:https://github.com/vectordb/vector-database.git</scm.connection>
+        <scm.developerConnection>scm:git:ssh://github.com:vectordb/vector-database.git</scm.developerConnection>
     </properties>
 
     <dependencies>
@@ -72,11 +79,29 @@
             <artifactId>commons-lang3</artifactId>
             <version>3.12.0</version>
         </dependency>
+
+        <!-- Native Library Loader for cross-platform native library loading -->
+        <dependency>
+            <groupId>org.scijava</groupId>
+            <artifactId>native-lib-loader</artifactId>
+            <version>${native-lib-loader.version}</version>
+        </dependency>
     </dependencies>
 
     <build>
         <sourceDirectory>src/main/java</sourceDirectory>
         <testSourceDirectory>src/test/java</testSourceDirectory>
+
+        <!-- 确保 native 库被包含在 classpath 中 -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <includes>
+                    <include>**/*</include>
+                </includes>
+            </resource>
+        </resources>
+
         <plugins>
             <!-- Maven Compiler Plugin -->
             <plugin>
@@ -144,6 +169,81 @@
                     </execution>
                 </executions>
             </plugin>
+
+            <!-- Native 代码自动编译插件 -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <!-- 运行 CMake -->
+                    <execution>
+                        <id>cmake</id>
+                        <phase>generate-resources</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <executable>sh</executable>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>
+                                    mkdir -p "${project.basedir}/native/build" &amp;&amp;
+                                    cd "${project.basedir}/native/build" &amp;&amp;
+                                    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF ..
+                                </argument>
+                            </arguments>
+                            <skip>${skipNative}</skip>
+                        </configuration>
+                    </execution>
+                    <!-- 编译 Native 库 -->
+                    <execution>
+                        <id>make</id>
+                        <phase>compile</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <executable>make</executable>
+                            <workingDirectory>${project.basedir}/native/build</workingDirectory>
+                            <arguments>
+                                <argument>-j4</argument>
+                                <argument>vectordb</argument>
+                            </arguments>
+                            <skip>${skipNative}</skip>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- 复制 native 库到资源目录 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+                <executions>
+                    <execution>
+                        <id>copy-native-lib</id>
+                        <phase>compile</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.basedir}/src/main/resources/native</outputDirectory>
+                            <resources>
+                                <resource>
+                                    <directory>${project.basedir}/native/build</directory>
+                                    <includes>
+                                        <include>libvectordb*</include>
+                                        <include>vectordb.dll*</include>
+                                    </includes>
+                                </resource>
+                            </resources>
+                            <skip>${skipNative}</skip>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 
@@ -164,6 +264,123 @@
                     </plugin>
                 </plugins>
             </build>
+        </profile>
+
+        <!-- Profile to skip native compilation (use pre-compiled libraries) -->
+        <profile>
+            <id>skip-native</id>
+            <properties>
+                <skipNative>true</skipNative>
+            </properties>
+        </profile>
+
+        <!-- Profile for Windows build -->
+        <profile>
+            <id>windows</id>
+            <activation>
+                <os>
+                    <family>windows</family>
+                </os>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <configuration>
+                            <!-- Windows uses nmake instead of make -->
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Profile for release to Maven Central -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <!-- Source JAR -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>3.2.1</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!-- Javadoc JAR -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.4.1</version>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <doclint>none</doclint>
+                            <source>1.8</source>
+                        </configuration>
+                    </plugin>
+
+                    <!-- GPG Signing -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.0.1</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <gpgArguments>
+                                <gpgArgument>--pinentry-mode</gpgArgument>
+                                <gpgArgument>loopback</gpgArgument>
+                            </gpgArguments>
+                        </configuration>
+                    </plugin>
+
+                    <!-- Nexus Staging -->
+                    <plugin>
+                        <groupId>org.sonatype.plugins</groupId>
+                        <artifactId>nexus-staging-maven-plugin</artifactId>
+                        <version>1.6.13</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <serverId>ossrh</serverId>
+                            <nexusUrl>https://s01.oss.sonatype.org/</nexusUrl>
+                            <autoReleaseAfterClose>false</autoReleaseAfterClose>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+
+            <distributionManagement>
+                <snapshotRepository>
+                    <id>ossrh</id>
+                    <url>https://s01.oss.sonatype.org/content/repositories/snapshots</url>
+                </snapshotRepository>
+                <repository>
+                    <id>ossrh</id>
+                    <url>https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+                </repository>
+            </distributionManagement>
         </profile>
     </profiles>
 </project> 

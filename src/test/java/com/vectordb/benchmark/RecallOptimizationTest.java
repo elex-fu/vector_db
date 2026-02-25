@@ -107,19 +107,14 @@ public class RecallOptimizationTest {
 
     /**
      * 测试Fix #3 & #4: 召回率验证
-     * 这是最关键的测试
+     * 使用暴力搜索作为真值
      */
     @Test
     public void testFix34_RecallRate() throws IOException {
         log.info("\n========== Fix #3 & #4: 召回率验证测试 ==========");
 
-        // 创建HNSW基线 (无压缩，精确搜索)
-        VectorDatabase baselineDb = new VectorDatabase.Builder()
-                .withDimension(DIMENSION)
-                .withMaxElements(NUM_VECTORS * 2)
-                .withStoragePath(TEST_DB_PATH + "_baseline")
-                .withIndexType(VectorDatabase.IndexType.HNSW)
-                .build();
+        // 存储所有向量用于暴力搜索
+        Map<Integer, float[]> allVectors = new HashMap<>();
 
         // 创建HNSWPQ优化版本
         VectorDatabase optimizedDb = new VectorDatabase.Builder()
@@ -129,16 +124,15 @@ public class RecallOptimizationTest {
                 .withCompression(CompressionConfig.recommendedConfig(DIMENSION))
                 .build();
 
-        log.info("添加{}个向量到基线数据库...", NUM_VECTORS);
+        log.info("添加{}个向量到数据库...", NUM_VECTORS);
         for (int i = 0; i < NUM_VECTORS; i++) {
             float[] vector = generateRandomVector(DIMENSION);
-            baselineDb.addVector(i, vector);
+            allVectors.put(i, vector);
             optimizedDb.addVector(i, vector);
         }
 
-        log.info("基线数据库向量数: {}", baselineDb.size());
-        log.info("优化数据库向量数: {}", optimizedDb.size());
-        log.info("优化数据库压缩比: {}x", String.format("%.2f", optimizedDb.getCompressionRatio()));
+        log.info("数据库向量数: {}", optimizedDb.size());
+        log.info("数据库压缩比: {}x", String.format("%.2f", optimizedDb.getCompressionRatio()));
 
         // 生成查询向量
         List<float[]> queries = new ArrayList<>();
@@ -148,31 +142,41 @@ public class RecallOptimizationTest {
 
         // 计算召回率
         double totalRecall = 0;
-        double totalBaselineTime = 0;
+        double totalBruteForceTime = 0;
         double totalOptimizedTime = 0;
 
         for (int i = 0; i < NUM_QUERIES; i++) {
             float[] query = queries.get(i);
 
-            // 基线搜索 (精确结果)
+            // 暴力搜索真值
             long start = System.nanoTime();
-            List<SearchResult> baselineResults = baselineDb.search(query, K);
-            totalBaselineTime += (System.nanoTime() - start) / 1_000_000.0;
+            PriorityQueue<SearchResult> bruteForceResults = new PriorityQueue<>(
+                    Comparator.comparing(SearchResult::getDistance).reversed());
+            for (Map.Entry<Integer, float[]> entry : allVectors.entrySet()) {
+                float dist = squaredEuclideanDistance(query, entry.getValue());
+                bruteForceResults.add(new SearchResult(entry.getKey(), dist));
+                if (bruteForceResults.size() > K) {
+                    bruteForceResults.poll();
+                }
+            }
+            List<SearchResult> bruteForceTopK = new ArrayList<>(bruteForceResults);
+            bruteForceTopK.sort(Comparator.comparing(SearchResult::getDistance));
+            totalBruteForceTime += (System.nanoTime() - start) / 1_000_000.0;
 
-            // 优化版本搜索
+            // HNSWPQ搜索
             start = System.nanoTime();
             List<SearchResult> optimizedResults = optimizedDb.search(query, K);
             totalOptimizedTime += (System.nanoTime() - start) / 1_000_000.0;
 
             // 计算召回率
-            Set<Integer> baselineIds = new HashSet<>();
-            for (SearchResult r : baselineResults) {
-                baselineIds.add(r.getId());
+            Set<Integer> groundTruthIds = new HashSet<>();
+            for (SearchResult r : bruteForceTopK) {
+                groundTruthIds.add(r.getId());
             }
 
             int matchCount = 0;
             for (SearchResult r : optimizedResults) {
-                if (baselineIds.contains(r.getId())) {
+                if (groundTruthIds.contains(r.getId())) {
                     matchCount++;
                 }
             }
@@ -182,18 +186,18 @@ public class RecallOptimizationTest {
         }
 
         double avgRecall = totalRecall / NUM_QUERIES;
-        double avgBaselineTime = totalBaselineTime / NUM_QUERIES;
+        double avgBruteForceTime = totalBruteForceTime / NUM_QUERIES;
         double avgOptimizedTime = totalOptimizedTime / NUM_QUERIES;
-        double baselineQPS = 1000.0 / avgBaselineTime * NUM_QUERIES;
+        double bruteForceQPS = 1000.0 / avgBruteForceTime * NUM_QUERIES;
         double optimizedQPS = 1000.0 / avgOptimizedTime * NUM_QUERIES;
 
         log.info("\n========== 测试结果 ==========");
         log.info("平均Recall@{}: {}%", K, String.format("%.2f", avgRecall * 100));
-        log.info("基线平均延迟: {}ms", String.format("%.2f", avgBaselineTime));
+        log.info("暴力搜索平均延迟: {}ms", String.format("%.2f", avgBruteForceTime));
         log.info("优化平均延迟: {}ms", String.format("%.2f", avgOptimizedTime));
-        log.info("基线QPS: {}", String.format("%.0f", baselineQPS));
+        log.info("暴力搜索QPS: {}", String.format("%.0f", bruteForceQPS));
         log.info("优化QPS: {}", String.format("%.0f", optimizedQPS));
-        log.info("延迟增加: {}x", String.format("%.2f", avgOptimizedTime / avgBaselineTime));
+        log.info("速度提升: {}x", String.format("%.2f", bruteForceQPS / optimizedQPS));
         log.info("压缩比: {}x", String.format("%.2f", optimizedDb.getCompressionRatio()));
 
         // 断言
@@ -202,14 +206,22 @@ public class RecallOptimizationTest {
 
         log.info("\n✓ 召回率优化成功! {}% -> {}%+", "8.56", String.format("%.2f", avgRecall * 100));
 
-        baselineDb.close();
         optimizedDb.close();
-        deleteDirectory(new File(TEST_DB_PATH + "_baseline"));
         deleteDirectory(new File(TEST_DB_PATH + "_optimized"));
+    }
+
+    private float squaredEuclideanDistance(float[] a, float[] b) {
+        float sum = 0;
+        for (int i = 0; i < a.length; i++) {
+            float diff = a[i] - b[i];
+            sum += diff * diff;
+        }
+        return sum;
     }
 
     /**
      * 快速召回率测试 (较少数据，用于快速验证)
+     * 使用暴力搜索作为真值
      */
     @Test
     public void testQuickRecallValidation() throws IOException {
@@ -218,12 +230,7 @@ public class RecallOptimizationTest {
         int quickTestSize = 5000;
         int quickQueries = 50;
 
-        VectorDatabase baselineDb = new VectorDatabase.Builder()
-                .withDimension(DIMENSION)
-                .withMaxElements(quickTestSize * 2)
-                .withStoragePath(TEST_DB_PATH + "_quick_base")
-                .withIndexType(VectorDatabase.IndexType.HNSW)
-                .build();
+        Map<Integer, float[]> allVectors = new HashMap<>();
 
         VectorDatabase optimizedDb = new VectorDatabase.Builder()
                 .withDimension(DIMENSION)
@@ -235,7 +242,7 @@ public class RecallOptimizationTest {
         // 添加数据
         for (int i = 0; i < quickTestSize; i++) {
             float[] vector = generateRandomVector(DIMENSION);
-            baselineDb.addVector(i, vector);
+            allVectors.put(i, vector);
             optimizedDb.addVector(i, vector);
         }
 
@@ -246,16 +253,27 @@ public class RecallOptimizationTest {
         for (int i = 0; i < quickQueries; i++) {
             float[] query = generateRandomVector(DIMENSION);
 
-            List<SearchResult> baselineResults = baselineDb.search(query, K);
+            // 暴力搜索真值
+            PriorityQueue<SearchResult> bruteForceResults = new PriorityQueue<>(
+                    Comparator.comparing(SearchResult::getDistance).reversed());
+            for (Map.Entry<Integer, float[]> entry : allVectors.entrySet()) {
+                float dist = squaredEuclideanDistance(query, entry.getValue());
+                bruteForceResults.add(new SearchResult(entry.getKey(), dist));
+                if (bruteForceResults.size() > K) {
+                    bruteForceResults.poll();
+                }
+            }
+            List<SearchResult> groundTruth = new ArrayList<>(bruteForceResults);
+
             List<SearchResult> optimizedResults = optimizedDb.search(query, K);
 
-            Set<Integer> baselineIds = new HashSet<>();
-            for (SearchResult r : baselineResults) {
-                baselineIds.add(r.getId());
+            Set<Integer> groundTruthIds = new HashSet<>();
+            for (SearchResult r : groundTruth) {
+                groundTruthIds.add(r.getId());
             }
 
             for (SearchResult r : optimizedResults) {
-                if (baselineIds.contains(r.getId())) {
+                if (groundTruthIds.contains(r.getId())) {
                     matches++;
                 }
             }
@@ -267,9 +285,7 @@ public class RecallOptimizationTest {
 
         assertTrue("快速测试Recall应 >= 70%", recall >= 0.70);
 
-        baselineDb.close();
         optimizedDb.close();
-        deleteDirectory(new File(TEST_DB_PATH + "_quick_base"));
         deleteDirectory(new File(TEST_DB_PATH + "_quick_opt"));
     }
 

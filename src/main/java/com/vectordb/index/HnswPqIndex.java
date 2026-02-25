@@ -28,8 +28,8 @@ public class HnswPqIndex implements VectorIndex {
     private int efConstruction = 64;
     private int ef = 64;
     private int maxLevel;
-    private boolean useCosineSimilarity = true;
-    private boolean normalizeVectors = true;
+    private boolean useCosineSimilarity = false;  // 统一使用欧氏距离，避免与PQ距离不一致
+    private boolean normalizeVectors = false;  // 禁用归一化，避免训练和搜索时向量分布不一致
 
     // PQ参数
     private int pqSubspaces;
@@ -444,7 +444,12 @@ public class HnswPqIndex implements VectorIndex {
                 }
             }
 
-            currentEntryPoint = id;
+            // 使用找到的最近邻居作为下一层的入口点（如果存在）
+            if (!selectedNeighbors.isEmpty()) {
+                currentEntryPoint = selectedNeighbors.get(0);
+            } else {
+                currentEntryPoint = id;
+            }
         }
 
         if (level > idToLevel.getOrDefault(entryPoint, -1)) {
@@ -489,7 +494,9 @@ public class HnswPqIndex implements VectorIndex {
 
         for (int currentLevel = Math.min(level, maxLevel - 1); currentLevel >= 0; currentLevel--) {
             // 使用精确距离搜索邻居（建图质量更高）
-            List<SearchResult> neighbors = searchLayer(vector, currentEntryPoint, efConstruction, currentLevel);
+            // 增大efConstruction以获得更好的候选池
+            int buildEf = Math.max(efConstruction, 200);
+            List<SearchResult> neighbors = searchLayer(vector, currentEntryPoint, buildEf, currentLevel);
             List<Integer> selectedNeighbors = selectNeighbors(vector, neighbors, m);
 
             graph.get(currentLevel).put(id, new ArrayList<>(selectedNeighbors));
@@ -516,7 +523,12 @@ public class HnswPqIndex implements VectorIndex {
                 }
             }
 
-            currentEntryPoint = id;
+            // 使用找到的最近邻居作为下一层的入口点（如果存在）
+            if (!selectedNeighbors.isEmpty()) {
+                currentEntryPoint = selectedNeighbors.get(0);
+            } else {
+                currentEntryPoint = id;
+            }
         }
 
         if (level > idToLevel.getOrDefault(entryPoint, -1)) {
@@ -610,44 +622,46 @@ public class HnswPqIndex implements VectorIndex {
 
             int currentEntryPoint = entryPoint;
 
-            // 使用PQ距离进行上层搜索
-            if (trained) {
-                for (int currentLevel = maxLevel - 1; currentLevel > 0; currentLevel--) {
+            // 使用PQ距离进行上层搜索 (统一逻辑，无论是否训练完成)
+            for (int currentLevel = maxLevel - 1; currentLevel > 0; currentLevel--) {
+                if (trained) {
                     currentEntryPoint = searchLayerClosestCompressed(normalizedQuery, currentEntryPoint, currentLevel);
-                }
-
-                // Fix #3: 双层重排序策略
-                // Layer 1: 使用PQ距离收集更多候选
-                int candidatePoolSize = Math.min(k * 500, dataSize);  // 500倍候选池
-                List<SearchResult> candidates = searchLayerWithSize(normalizedQuery, currentEntryPoint, candidatePoolSize, 0);
-
-                // Layer 2: 对Top-(100*k)进行精确距离重排序
-                int firstLevelSize = Math.min(k * 100, candidates.size());
-                List<SearchResult> refinedCandidates = new ArrayList<>();
-
-                for (int i = 0; i < firstLevelSize; i++) {
-                    SearchResult candidate = candidates.get(i);
-                    Vector candidateVector = vectors.get(candidate.getId());
-                    if (candidateVector != null) {
-                        float exactDist = calculateDistance(normalizedQuery, candidateVector);
-                        refinedCandidates.add(new SearchResult(candidate.getId(), exactDist));
-                    }
-                }
-
-                // 按精确距离排序
-                refinedCandidates.sort(Comparator.comparing(SearchResult::getDistance));
-
-                // 返回Top-k
-                return refinedCandidates.size() <= k ?
-                        refinedCandidates : refinedCandidates.subList(0, k);
-            } else {
-                for (int currentLevel = maxLevel - 1; currentLevel > 0; currentLevel--) {
+                } else {
                     currentEntryPoint = searchLayerClosest(normalizedQuery, currentEntryPoint, currentLevel);
                 }
-
-                List<SearchResult> results = searchLayer(normalizedQuery, currentEntryPoint, searchEf, 0);
-                return results.size() <= k ? results : results.subList(0, k);
             }
+
+            // Fix #3: 双层重排序策略 (已训练和未训练都使用统一的精确距离重排序)
+            List<SearchResult> candidates;
+            if (trained) {
+                // Layer 1: 使用PQ距离收集更多候选
+                int candidatePoolSize = Math.max(searchEf, k * 100);  // 至少searchEf个候选
+                // 图结构检查已移除（调试完成）
+                candidates = searchLayerWithSize(normalizedQuery, currentEntryPoint, candidatePoolSize, 0);
+            } else {
+                // 未训练时使用普通搜索
+                candidates = searchLayer(normalizedQuery, currentEntryPoint, searchEf, 0);
+            }
+
+            // Layer 2: 对候选进行精确距离重排序
+            List<SearchResult> refinedCandidates = new ArrayList<>();
+            int refineSize = Math.min(Math.max(candidates.size(), k * 50), candidates.size());  // 重排序前50*k个
+
+            for (int i = 0; i < refineSize; i++) {
+                SearchResult candidate = candidates.get(i);
+                Vector candidateVector = vectors.get(candidate.getId());
+                if (candidateVector != null) {
+                    float exactDist = calculateDistance(normalizedQuery, candidateVector);
+                    refinedCandidates.add(new SearchResult(candidate.getId(), exactDist));
+                }
+            }
+
+            // 按精确距离排序
+            refinedCandidates.sort(Comparator.comparing(SearchResult::getDistance));
+
+            // 返回Top-k
+            return refinedCandidates.size() <= k ?
+                    refinedCandidates : refinedCandidates.subList(0, k);
         } catch (Exception e) {
             log.error("搜索最近邻时发生异常: {}", e.getMessage(), e);
             return new ArrayList<>();
@@ -716,8 +730,23 @@ public class HnswPqIndex implements VectorIndex {
         if (useCosineSimilarity) {
             return 1.0f - v1.cosineSimilarity(v2);
         } else {
-            return v1.euclideanDistance(v2);
+            // 使用平方欧氏距离（不开方），与test一致
+            return squaredEuclideanDistance(v1, v2);
         }
+    }
+
+    /**
+     * 计算平方欧氏距离（不开方，提高性能）
+     */
+    private float squaredEuclideanDistance(Vector v1, Vector v2) {
+        float[] a = v1.getValues();
+        float[] b = v2.getValues();
+        float sum = 0;
+        for (int i = 0; i < a.length; i++) {
+            float diff = a[i] - b[i];
+            sum += diff * diff;
+        }
+        return sum;
     }
 
     private int assignLevel() {
@@ -822,8 +851,9 @@ public class HnswPqIndex implements VectorIndex {
                 SearchResult current = candidateSet.poll();
                 if (current == null) continue;
 
-                if (current.getDistance() > furthestDistance) {
-                    break;
+                // 如果当前候选距离已经超过当前结果集中最远的距离，且结果集已满，则跳过
+                if (current.getDistance() > furthestDistance && resultSet.size() >= ef) {
+                    continue;
                 }
 
                 Map<Integer, List<Integer>> layerGraph = graph.get(level);
@@ -893,9 +923,14 @@ public class HnswPqIndex implements VectorIndex {
 
             float furthestDistance = distance;
 
-            while (!candidateSet.isEmpty() && resultSet.size() < targetSize) {
+            while (!candidateSet.isEmpty()) {
                 SearchResult current = candidateSet.poll();
                 if (current == null) continue;
+
+                // 如果当前候选距离已经超过当前结果集中最远的距离，且结果集已满，则终止搜索
+                if (current.getDistance() > furthestDistance && resultSet.size() >= targetSize) {
+                    break;
+                }
 
                 Map<Integer, List<Integer>> layerGraph = graph.get(level);
                 if (layerGraph == null) continue;
@@ -914,14 +949,17 @@ public class HnswPqIndex implements VectorIndex {
                     float neighborDistance = calculateDistance(neighborVector, queryVector);
                     SearchResult neighborResult = new SearchResult(neighborId, neighborDistance);
 
+                    // 只要结果集未满，或者新距离优于当前最远距离，就加入
                     if (resultSet.size() < targetSize || neighborDistance < furthestDistance) {
                         candidateSet.add(neighborResult);
                         resultSet.add(neighborResult);
 
+                        // 更新最远距离
                         if (resultSet.size() > targetSize) {
-                            resultSet.poll();
-                            furthestDistance = resultSet.peek().getDistance();
+                            resultSet.poll(); // 移除最远的
                         }
+                        // 始终更新furthestDistance为当前结果集中最远的
+                        furthestDistance = resultSet.peek().getDistance();
                     }
                 }
             }
@@ -961,8 +999,9 @@ public class HnswPqIndex implements VectorIndex {
                 SearchResult current = candidateSet.poll();
                 if (current == null) continue;
 
-                if (current.getDistance() > furthestDistance) {
-                    break;
+                // 如果当前候选距离已经超过当前结果集中最远的距离，且结果集已满，则跳过
+                if (current.getDistance() > furthestDistance && resultSet.size() >= ef) {
+                    continue;
                 }
 
                 Map<Integer, List<Integer>> layerGraph = graph.get(level);

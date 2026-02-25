@@ -227,22 +227,26 @@ public class HnswIndex implements VectorIndex {
                     }
                 }
                 
-                // 更新入口点
-                currentEntryPoint = id;
+                // 使用找到的最近邻居作为下一层的入口点（如果存在）
+                if (!selectedNeighbors.isEmpty()) {
+                    currentEntryPoint = selectedNeighbors.get(0);
+                } else {
+                    currentEntryPoint = id;
+                }
             }
-            
+
             // 如果新节点的层级高于当前入口点，更新入口点
             if (level > idToLevel.getOrDefault(entryPoint, -1)) {
                 entryPoint = id;
             }
-            
+
             return true;
         } catch (Exception e) {
             log.error("添加向量时发生异常: {}", e.getMessage(), e);
             return false;
         }
     }
-    
+
     /**
      * 从索引中移除向量
      */
